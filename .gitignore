@@ -10,3 +10,5 @@ __pycache__/
 face-data/
 uploads/
 temp/
+.deepface/
+tests/face.jpg

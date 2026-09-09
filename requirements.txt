@@ -5,3 +5,4 @@ opencv-python==4.11.0.86
 fastapi==0.141.1
 uvicorn==0.52.4
 python-multipart==0.0.32
+pillow==12.3.0

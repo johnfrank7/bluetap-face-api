@@ -1,286 +1,161 @@
+import asyncio
+import logging
 import os
-import tempfile
-from pathlib import Path
+from contextlib import asynccontextmanager
 
-from deepface import DeepFace
+from runtime import (MODEL_NAME, DETECTOR_BACKEND, ANTI_SPOOFING,
+                     INFERENCE_LOCK, model_ready, preload_model)
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from starlette.concurrency import run_in_threadpool
+from image_utils import prepare_image
 
-from face_service import (
-    enroll_subject,
-    generate_embedding,
-    search_duplicate,
-)
+logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="BlueTap Face Verification API",
-    version="1.0.0",
-)
 
-ALLOWED_IMAGE_TYPES = {
-    "image/jpeg",
-    "image/jpg",
-    "image/png",
-    "image/webp",
-}
+@asynccontextmanager
+async def lifespan(app):
+    task = asyncio.create_task(run_in_threadpool(preload_model))
+    yield
+    await task
 
-DEEPFACE_API_KEY = os.getenv(
-    "DEEPFACE_API_KEY",
-    "bluetap-local-dev-key",
-)
 
+app = FastAPI(title="BlueTap Face Verification API", version="1.0.0", lifespan=lifespan)
+DEEPFACE_API_KEY = os.getenv("DEEPFACE_API_KEY", "bluetap-local-dev-key")
 security = HTTPBearer(auto_error=False)
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
 
 
-def require_api_key(
-    credentials: HTTPAuthorizationCredentials | None = Depends(security),
-):
+class UploadLimitMiddleware:
+    """Bound the entire multipart body before parsing, including chunked uploads."""
+    def __init__(self, app):
+        self.app = app
+        self.busy = False
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] != "POST":
+            return await self.app(scope, receive, send)
+        if self.busy:
+            return await JSONResponse(
+                {"detail": "Face service is busy. Please retry later."}, status_code=503
+            )(scope, receive, send)
+        self.busy = True
+        total = 0
+        async def limited_receive():
+            nonlocal total
+            message = await receive()
+            total += len(message.get("body", b""))
+            if total > 11 * 1024 * 1024:
+                # Drain without buffering so clients receive the JSON 413 reliably.
+                while message.get("more_body", False):
+                    message = await receive()
+                raise HTTPException(413, "Request exceeds 11 MiB.")
+            return message
+        try:
+            await self.app(scope, limited_receive, send)
+        finally:
+            self.busy = False
+
+
+app.add_middleware(UploadLimitMiddleware)
+
+
+def require_api_key(credentials: HTTPAuthorizationCredentials | None = Depends(security)):
     if credentials is None:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing API key.",
-        )
-
+        raise HTTPException(401, "Missing API key.")
     if credentials.scheme.lower() != "bearer":
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid authentication scheme.",
-        )
-
+        raise HTTPException(401, "Invalid authentication scheme.")
     if credentials.credentials != DEEPFACE_API_KEY:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid API key.",
-        )
-
+        raise HTTPException(401, "Invalid API key.")
     return True
 
 
 @app.get("/")
 def root():
-    return {
-        "service": "BlueTap Face Verification API",
-        "status": "running",
-    }
+    return {"service": "BlueTap Face Verification API", "status": "running"}
 
 
 @app.get("/health")
-def health():
-    return {
-        "status": "ok",
-    }
+async def health():
+    return {"status": "ok", "model": MODEL_NAME}
+
+
+@app.get("/ready")
+async def ready():
+    loaded = model_ready()
+    return JSONResponse({"status": "ready" if loaded else "not_ready", "model": MODEL_NAME,
+                         "modelLoaded": loaded}, status_code=200 if loaded else 503)
+
+
+def process(operation, uploads, subject_id=None):
+    if not model_ready():
+        raise HTTPException(503, "Face model is not ready. Please retry later.")
+    if not INFERENCE_LOCK.acquire(blocking=False):
+        raise HTTPException(503, "Face service is busy. Please retry later.")
+    try:
+        for upload in uploads:
+            if upload.content_type not in ALLOWED_IMAGE_TYPES:
+                raise HTTPException(400, "A supported face image is required.")
+        images = [prepare_image(upload) for upload in uploads]
+        from deepface import DeepFace
+        from face_service import generate_embedding, search_duplicate, enroll_subject
+        if operation == "verify":
+            result = DeepFace.verify(img1_path=images[0], img2_path=images[1],
+                                     model_name=MODEL_NAME, detector_backend=DETECTOR_BACKEND,
+                                     enforce_detection=True, anti_spoofing=ANTI_SPOOFING)
+            return {"verified": bool(result.get("verified", False)),
+                    **{key: result.get(key) for key in ("distance", "threshold", "model",
+                                                       "detector_backend", "similarity_metric")}}
+        embedding = generate_embedding(images[0])
+        result = search_duplicate(embedding)
+        response = {"duplicateDetected": result["matched"], "distance": result["distance"],
+                    "threshold": result["threshold"], "reviewRequired": result["matched"]}
+        if operation == "duplicate":
+            return response
+        if result["matched"]:
+            return {"enrolled": False, **response}
+        enroll_subject(subject_id, embedding)
+        return {"enrolled": True, "duplicateDetected": False, "reviewRequired": False}
+    except HTTPException:
+        raise
+    except ValueError:
+        logger.exception("Face %s rejected an image", operation)
+        raise HTTPException(400, "Could not process the face image. Use a clear photo with a visible face.") from None
+    except Exception:
+        logger.exception("Face %s failed", operation)
+        raise HTTPException(500, {"verify": "Face verification failed.",
+                                  "duplicate": "Duplicate face check failed.",
+                                  "enroll": "Face enrollment failed."}[operation]) from None
+    finally:
+        INFERENCE_LOCK.release()
+
+
+async def handle(operation, uploads, subject_id=None):
+    try:
+        return await run_in_threadpool(process, operation, uploads, subject_id)
+    finally:
+        # Closes and deletes Starlette's spooled temporary upload files.
+        for upload in uploads:
+            await upload.close()
 
 
 @app.post("/verify-face")
-async def verify_face(
-    image1: UploadFile = File(...),
-    image2: UploadFile = File(...),
-    _: bool = Depends(require_api_key),
-):
-    if image1.content_type not in ALLOWED_IMAGE_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail="image1 must be a supported image file.",
-        )
-
-    if image2.content_type not in ALLOWED_IMAGE_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail="image2 must be a supported image file.",
-        )
-
-    temp_paths = []
-
-    try:
-        for upload in (image1, image2):
-            suffix = Path(upload.filename or "image.jpg").suffix or ".jpg"
-
-            with tempfile.NamedTemporaryFile(
-                delete=False,
-                suffix=suffix,
-            ) as temp_file:
-                temp_file.write(await upload.read())
-                temp_paths.append(temp_file.name)
-
-        result = DeepFace.verify(
-            img1_path=temp_paths[0],
-            img2_path=temp_paths[1],
-            model_name="Facenet512",
-            detector_backend="opencv",
-            enforce_detection=True,
-        )
-
-        return {
-            "verified": bool(result.get("verified", False)),
-            "distance": result.get("distance"),
-            "threshold": result.get("threshold"),
-            "model": result.get("model"),
-            "detector_backend": result.get("detector_backend"),
-            "similarity_metric": result.get("similarity_metric"),
-        }
-
-    except ValueError as error:
-        underlying_error = error.__cause__
-
-        detail = (
-            str(underlying_error)
-            if underlying_error is not None
-            else str(error)
-        )
-
-        print("DeepFace ValueError:", repr(error))
-        print("Underlying error:", repr(underlying_error))
-
-        raise HTTPException(
-            status_code=400,
-            detail=detail,
-        )
-
-    except Exception as error:
-        print("Face verification error:", repr(error))
-
-        raise HTTPException(
-            status_code=500,
-            detail="Face verification failed.",
-        )
-
-    finally:
-        for path in temp_paths:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+async def verify_face(image1: UploadFile = File(...), image2: UploadFile = File(...),
+                      _: bool = Depends(require_api_key)):
+    return await handle("verify", [image1, image2])
 
 
 @app.post("/check-duplicate")
-async def check_duplicate(
-    image: UploadFile = File(...),
-    _: bool = Depends(require_api_key),
-):
-    if image.content_type not in ALLOWED_IMAGE_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail="A supported face image is required.",
-        )
-
-    temp_path = None
-
-    try:
-        suffix = Path(image.filename or "face.jpg").suffix or ".jpg"
-
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=suffix,
-        ) as temp_file:
-            temp_file.write(await image.read())
-            temp_path = temp_file.name
-
-        embedding = generate_embedding(temp_path)
-
-        result = search_duplicate(embedding)
-
-        return {
-            "duplicateDetected": result["matched"],
-            "distance": result["distance"],
-            "threshold": result["threshold"],
-            "reviewRequired": result["matched"],
-        }
-
-    except ValueError as error:
-        raise HTTPException(
-            status_code=400,
-            detail=str(error),
-        )
-
-    except Exception as error:
-        print("Duplicate search error:", repr(error))
-
-        raise HTTPException(
-            status_code=500,
-            detail="Duplicate face check failed.",
-        )
-
-    finally:
-        if temp_path:
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+async def check_duplicate(image: UploadFile = File(...), _: bool = Depends(require_api_key)):
+    return await handle("duplicate", [image])
 
 
 @app.post("/enroll-face")
-async def enroll_face(
-    subject_id: str = Form(...),
-    image: UploadFile = File(...),
-    _: bool = Depends(require_api_key),
-):
+async def enroll_face(subject_id: str = Form(...), image: UploadFile = File(...),
+                      _: bool = Depends(require_api_key)):
     subject_id = subject_id.strip()
-
     if not subject_id:
-        raise HTTPException(
-            status_code=400,
-            detail="subject_id is required.",
-        )
-
-    if image.content_type not in ALLOWED_IMAGE_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail="A supported face image is required.",
-        )
-
-    temp_path = None
-
-    try:
-        suffix = Path(image.filename or "face.jpg").suffix or ".jpg"
-
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=suffix,
-        ) as temp_file:
-            temp_file.write(await image.read())
-            temp_path = temp_file.name
-
-        embedding = generate_embedding(temp_path)
-
-        duplicate = search_duplicate(embedding)
-
-        if duplicate["matched"]:
-            return {
-                "enrolled": False,
-                "duplicateDetected": True,
-                "reviewRequired": True,
-                "distance": duplicate["distance"],
-                "threshold": duplicate["threshold"],
-            }
-
-        enroll_subject(
-            subject_id=subject_id,
-            embedding=embedding,
-        )
-
-        return {
-            "enrolled": True,
-            "duplicateDetected": False,
-            "reviewRequired": False,
-        }
-
-    except ValueError as error:
-        raise HTTPException(
-            status_code=400,
-            detail=str(error),
-        )
-
-    except Exception as error:
-        print("Enrollment error:", repr(error))
-
-        raise HTTPException(
-            status_code=500,
-            detail="Face enrollment failed.",
-        )
-
-    finally:
-        if temp_path:
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+        await image.close()
+        raise HTTPException(400, "subject_id is required.")
+    return await handle("enroll", [image], subject_id)
