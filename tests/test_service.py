@@ -29,6 +29,21 @@ class ImageTests(unittest.TestCase):
 
 
 class DatabaseTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from runtime import preload_model, model_ready
+        preload_model()
+        assert model_ready()
+
+    def test_old_sface_schema_rejected(self):
+        import face_service as service
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "embeddings.json"
+            path.write_text(json.dumps({"model": "SFace", "subjects": [{"embedding": [0.1] * 128}]}))
+            with patch.object(service, "FACE_DATA_DIR", Path(directory)), patch.object(service, "FACE_DATABASE_PATH", path):
+                with self.assertRaises(RuntimeError):
+                    service.load_database()
+
     def test_legacy_database_is_preserved_and_rejected(self):
         import face_service as service
         with tempfile.TemporaryDirectory() as directory:

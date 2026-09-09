@@ -12,3 +12,8 @@ uploads/
 temp/
 .deepface/
 tests/face.jpg
+
+models/*.onnx
+models/*.download
+.venv-native/
+tests/face*.jpg

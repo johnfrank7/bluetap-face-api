@@ -4,7 +4,7 @@ import os
 from contextlib import asynccontextmanager
 
 from runtime import (MODEL_NAME, DETECTOR_BACKEND, ANTI_SPOOFING,
-                     INFERENCE_LOCK, model_ready, preload_model)
+                     INFERENCE_LOCK, model_ready, preload_model, verify_images)
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -85,7 +85,7 @@ async def health():
 async def ready():
     loaded = model_ready()
     return JSONResponse({"status": "ready" if loaded else "not_ready", "model": MODEL_NAME,
-                         "modelLoaded": loaded}, status_code=200 if loaded else 503)
+                         "recognizer": "OpenCV SFace", "detector": "YuNet", "modelLoaded": loaded}, status_code=200 if loaded else 503)
 
 
 def process(operation, uploads, subject_id=None):
@@ -98,15 +98,9 @@ def process(operation, uploads, subject_id=None):
             if upload.content_type not in ALLOWED_IMAGE_TYPES:
                 raise HTTPException(400, "A supported face image is required.")
         images = [prepare_image(upload) for upload in uploads]
-        from deepface import DeepFace
         from face_service import generate_embedding, search_duplicate, enroll_subject
         if operation == "verify":
-            result = DeepFace.verify(img1_path=images[0], img2_path=images[1],
-                                     model_name=MODEL_NAME, detector_backend=DETECTOR_BACKEND,
-                                     enforce_detection=True, anti_spoofing=ANTI_SPOOFING)
-            return {"verified": bool(result.get("verified", False)),
-                    **{key: result.get(key) for key in ("distance", "threshold", "model",
-                                                       "detector_backend", "similarity_metric")}}
+            return verify_images(images[0], images[1])
         embedding = generate_embedding(images[0])
         result = search_duplicate(embedding)
         response = {"duplicateDetected": result["matched"], "distance": result["distance"],

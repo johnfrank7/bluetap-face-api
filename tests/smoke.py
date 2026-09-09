@@ -34,13 +34,31 @@ class SmokeTests(unittest.TestCase):
         self.assertTrue(json.load(urllib.request.urlopen(BASE + "/ready"))["modelLoaded"])
 
     def test_real_face(self):
-        face = Path("tests/face.jpg").read_bytes()
-        status, result = post([("image1", face), ("image2", face)])
+        face = Path("tests/face-a.jpg").read_bytes()
+        status, result = post([("image1", face), ("image2", Path("tests/face-a2.jpg").read_bytes())])
         self.assertEqual(status, 200, result)
         self.assertTrue(result["verified"])
         self.assertEqual(result["model"], "SFace")
-        self.assertEqual(result["detector_backend"], "opencv")
+        self.assertEqual(result["detector_backend"], "yunet")
         self.assertEqual(set(result), {"verified", "distance", "threshold", "model", "detector_backend", "similarity_metric"})
+
+    def test_different_people(self):
+        status, result = post([("image1", Path("tests/face-a.jpg").read_bytes()),
+                               ("image2", Path("tests/face-b.jpg").read_bytes())])
+        self.assertEqual(status, 200, result)
+        self.assertFalse(result["verified"])
+        self.assertGreater(result["distance"], result["threshold"])
+
+    def test_multiple_faces(self):
+        with Image.open("tests/face-a.jpg") as source:
+            source.thumbnail((350, 350))
+            combined = Image.new("RGB", (source.width * 2, source.height))
+            combined.paste(source, (0, 0))
+            combined.paste(source, (source.width, 0))
+            output = io.BytesIO()
+            combined.save(output, format="JPEG")
+        status, result = post([("image1", output.getvalue()), ("image2", output.getvalue())])
+        self.assertEqual(status, 400, result)
 
     def test_bad_image(self):
         status, result = post([("image1", b"invalid"), ("image2", b"invalid")])
@@ -59,6 +77,12 @@ class SmokeTests(unittest.TestCase):
 
     def test_body_limit(self):
         self.assertEqual(post([("image1", b"x" * (12 * 1024 * 1024)), ("image2", b"x")])[0], 413)
+
+    def test_large_decoded_image(self):
+        output = io.BytesIO()
+        Image.new("RGB", (4000, 3000)).save(output, format="PNG")
+        status, result = post([("image1", output.getvalue()), ("image2", output.getvalue())])
+        self.assertEqual(status, 400, result)  # Safely resized, then rejected for no face.
 
     def test_auth(self):
         self.assertEqual(post([("image1", b"x"), ("image2", b"x")], key="invalid")[0], 401)
