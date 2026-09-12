@@ -104,12 +104,24 @@ class DevelopmentResetEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(retry["deletedEntries"], 0)
 
     async def test_reset_is_disabled_unless_store_is_explicitly_development(self):
+        with patch.dict(os.environ, {"ENABLE_DEVELOPMENT_FACE_RESET": "false"}):
+            with self.assertRaises(HTTPException) as disabled:
+                await application.reset_development_enrollments(
+                    application.DevelopmentResetRequest(dryRun=True), True
+                )
+        self.assertEqual(disabled.exception.status_code, 403)
+        self.assertEqual(disabled.exception.detail, "Development face reset is disabled.")
+
         with patch.dict(os.environ, {"FACE_DATA_ENVIRONMENT": "production"}):
             with self.assertRaises(HTTPException) as rejected:
                 await application.reset_development_enrollments(
                     application.DevelopmentResetRequest(dryRun=True), True
                 )
         self.assertEqual(rejected.exception.status_code, 403)
+        self.assertEqual(
+            rejected.exception.detail,
+            "Face storage is not declared as development-only.",
+        )
 
     async def test_health_and_ready_behavior_are_unchanged(self):
         result = await application.health()
