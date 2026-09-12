@@ -12,12 +12,17 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 from image_utils import prepare_image
+from config import development_face_reset_enabled, development_face_store_allowed
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app):
+    logger.info("Development face reset enabled: %s",
+                str(development_face_reset_enabled()).lower())
+    logger.info("Face data environment: %s",
+                "development" if development_face_store_allowed() else "non-development")
     task = asyncio.create_task(run_in_threadpool(preload_model))
     yield
     await task
@@ -87,7 +92,10 @@ async def health():
 async def ready():
     loaded = model_ready()
     return JSONResponse({"status": "ready" if loaded else "not_ready", "model": MODEL_NAME,
-                         "recognizer": "OpenCV SFace", "detector": "YuNet", "modelLoaded": loaded}, status_code=200 if loaded else 503)
+                         "recognizer": "OpenCV SFace", "detector": "YuNet", "modelLoaded": loaded,
+                         "developmentFaceResetEnabled": development_face_reset_enabled(),
+                         "faceDataEnvironment": "development" if development_face_store_allowed() else "non-development"},
+                        status_code=200 if loaded else 503)
 
 
 UID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -224,9 +232,9 @@ async def reset_development_enrollments(
     _: bool = Depends(require_api_key),
 ):
     """Reset a dedicated development dataset; never enabled implicitly."""
-    if os.getenv("ENABLE_DEVELOPMENT_FACE_RESET", "").lower() != "true":
+    if not development_face_reset_enabled():
         raise HTTPException(403, "Development face reset is disabled.")
-    if os.getenv("FACE_DATA_ENVIRONMENT", "").lower() != "development":
+    if not development_face_store_allowed():
         raise HTTPException(403, "Face storage is not declared as development-only.")
     if not request.dryRun and request.confirm != "RESET_BLUETAP_FACE_DEV":
         raise HTTPException(403, "Exact development reset confirmation is required.")

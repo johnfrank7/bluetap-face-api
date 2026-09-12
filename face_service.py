@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from runtime import MODEL_NAME, EMBEDDING_SCHEMA, DISTANCE_THRESHOLD, embedding, cosine_distance
+from config import development_face_reset_enabled, development_face_store_allowed
 
 
 FACE_DATA_DIR = Path("face-data")
@@ -129,9 +130,9 @@ def discard_registration_face(registration_session_id):
 
 def reset_development_face_storage(dry_run=True, confirmation=None):
     """Inspect or clear only a server-declared, dedicated development store."""
-    if os.getenv("ENABLE_DEVELOPMENT_FACE_RESET", "").lower() != "true":
+    if not development_face_reset_enabled():
         raise PermissionError("Development face reset is disabled.")
-    if os.getenv("FACE_DATA_ENVIRONMENT", "").lower() != "development":
+    if not development_face_store_allowed():
         raise PermissionError("Face storage is not declared as development-only.")
     if not dry_run and confirmation != DEVELOPMENT_RESET_CONFIRMATION:
         raise ValueError("Exact development reset confirmation is required.")

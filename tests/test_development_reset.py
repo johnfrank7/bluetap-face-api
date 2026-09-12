@@ -10,7 +10,35 @@ from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import ValidationError
 
 import app as application
+import config
 import face_service
+
+
+class EnvironmentParsingTests(unittest.TestCase):
+    def test_conventional_truthy_values_enable_reset(self):
+        for value in ("true", "TRUE", "1", "yes", "on", " On "):
+            with self.subTest(value=value), patch.dict(
+                os.environ, {"ENABLE_DEVELOPMENT_FACE_RESET": value}
+            ):
+                self.assertTrue(config.development_face_reset_enabled())
+
+    def test_false_missing_and_unknown_values_stay_disabled(self):
+        for value in ("false", "0", "no", "unknown", ""):
+            with self.subTest(value=value), patch.dict(
+                os.environ, {"ENABLE_DEVELOPMENT_FACE_RESET": value}
+            ):
+                self.assertFalse(config.development_face_reset_enabled())
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(config.development_face_reset_enabled())
+
+    def test_face_data_environment_is_trimmed_and_case_normalized(self):
+        for value in ("development", " development ", "DEVELOPMENT"):
+            with self.subTest(value=value), patch.dict(
+                os.environ, {"FACE_DATA_ENVIRONMENT": value}
+            ):
+                self.assertTrue(config.development_face_store_allowed())
+        with patch.dict(os.environ, {"FACE_DATA_ENVIRONMENT": "production"}):
+            self.assertFalse(config.development_face_store_allowed())
 
 
 class DevelopmentResetEndpointTests(unittest.IsolatedAsyncioTestCase):
@@ -87,6 +115,17 @@ class DevelopmentResetEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("subjects", result)
         self.assertNotIn("embedding", json.dumps(result))
         self.assertEqual(self.database_path.read_text(), before)
+
+    async def test_render_style_true_and_trimmed_development_return_dry_run(self):
+        with patch.dict(os.environ, {
+            "ENABLE_DEVELOPMENT_FACE_RESET": "true",
+            "FACE_DATA_ENVIRONMENT": " development ",
+        }):
+            result = await application.reset_development_enrollments(
+                application.DevelopmentResetRequest(dryRun=True), True
+            )
+        self.assertTrue(result["dryRun"])
+        self.assertEqual(result["scope"], "development")
 
     async def test_apply_preserves_schema_and_is_idempotent(self):
         request = application.DevelopmentResetRequest(
