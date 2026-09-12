@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 
 from runtime import (MODEL_NAME, DETECTOR_BACKEND, ANTI_SPOOFING,
@@ -88,8 +89,12 @@ async def ready():
                          "recognizer": "OpenCV SFace", "detector": "YuNet", "modelLoaded": loaded}, status_code=200 if loaded else 503)
 
 
-def process(operation, uploads, subject_id=None):
-    if not model_ready():
+UID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+REGISTRATION_SESSION_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+
+
+def process(operation, uploads=(), uid=None, registration_session_id=None):
+    if operation in {"verify", "duplicate", "store"} and not model_ready():
         raise HTTPException(503, "Face model is not ready. Please retry later.")
     if not INFERENCE_LOCK.acquire(blocking=False):
         raise HTTPException(503, "Face service is busy. Please retry later.")
@@ -98,7 +103,19 @@ def process(operation, uploads, subject_id=None):
             if upload.content_type not in ALLOWED_IMAGE_TYPES:
                 raise HTTPException(400, "A supported face image is required.")
         images = [prepare_image(upload) for upload in uploads]
-        from face_service import generate_embedding, search_duplicate, enroll_subject
+        from face_service import (discard_registration_face, finalize_registration_face,
+                                  generate_embedding, search_duplicate,
+                                  store_registration_face)
+        if operation == "discard":
+            return {"discarded": discard_registration_face(registration_session_id)}
+        if operation == "finalize":
+            result = finalize_registration_face(uid, registration_session_id)
+            if not result["enrolled"]:
+                duplicate = result["duplicate"]
+                return {"enrolled": False, "duplicateDetected": True,
+                        "distance": duplicate["distance"], "threshold": duplicate["threshold"],
+                        "reviewRequired": True}
+            return {"enrolled": True, "duplicateDetected": False, "reviewRequired": False}
         if operation == "verify":
             return verify_images(images[0], images[1])
         embedding = generate_embedding(images[0])
@@ -108,26 +125,31 @@ def process(operation, uploads, subject_id=None):
         if operation == "duplicate":
             return response
         if result["matched"]:
-            return {"enrolled": False, **response}
-        enroll_subject(subject_id, embedding)
-        return {"enrolled": True, "duplicateDetected": False, "reviewRequired": False}
+            return {"stored": False, **response}
+        temporary = store_registration_face(registration_session_id, embedding)
+        return {"stored": True, "duplicateDetected": False, "reviewRequired": False, **temporary}
     except HTTPException:
         raise
-    except ValueError:
+    except ValueError as error:
+        if operation == "finalize":
+            logger.info("Face finalization rejected: %s", error)
+            raise HTTPException(409, str(error)) from None
         logger.exception("Face %s rejected an image", operation)
         raise HTTPException(400, "Could not process the face image. Use a clear photo with a visible face.") from None
     except Exception:
         logger.exception("Face %s failed", operation)
         raise HTTPException(500, {"verify": "Face verification failed.",
                                   "duplicate": "Duplicate face check failed.",
-                                  "enroll": "Face enrollment failed."}[operation]) from None
+                                  "store": "Temporary registration face storage failed.",
+                                  "finalize": "Face enrollment failed.",
+                                  "discard": "Temporary registration cleanup failed."}[operation]) from None
     finally:
         INFERENCE_LOCK.release()
 
 
-async def handle(operation, uploads, subject_id=None):
+async def handle(operation, uploads=(), uid=None, registration_session_id=None):
     try:
-        return await run_in_threadpool(process, operation, uploads, subject_id)
+        return await run_in_threadpool(process, operation, uploads, uid, registration_session_id)
     finally:
         # Closes and deletes Starlette's spooled temporary upload files.
         for upload in uploads:
@@ -145,11 +167,36 @@ async def check_duplicate(image: UploadFile = File(...), _: bool = Depends(requi
     return await handle("duplicate", [image])
 
 
+def require_registration_session_id(registration_session_id: str):
+    registration_session_id = registration_session_id.strip()
+    if not REGISTRATION_SESSION_PATTERN.fullmatch(registration_session_id):
+        raise HTTPException(400, "A valid registrationSessionId is required.")
+    return registration_session_id
+
+
+def require_finalization_identifiers(uid: str, registration_session_id: str):
+    uid = uid.strip()
+    if not UID_PATTERN.fullmatch(uid):
+        raise HTTPException(400, "A valid finalized uid is required.")
+    return uid, require_registration_session_id(registration_session_id)
+
+
+@app.post("/store-registration-face")
+async def store_registration_face(registration_session_id: str = Form(...), image: UploadFile = File(...),
+                                  _: bool = Depends(require_api_key)):
+    registration_session_id = require_registration_session_id(registration_session_id)
+    return await handle("store", [image], registration_session_id=registration_session_id)
+
+
 @app.post("/enroll-face")
-async def enroll_face(subject_id: str = Form(...), image: UploadFile = File(...),
+async def enroll_face(uid: str = Form(...), registration_session_id: str = Form(...),
                       _: bool = Depends(require_api_key)):
-    subject_id = subject_id.strip()
-    if not subject_id:
-        await image.close()
-        raise HTTPException(400, "subject_id is required.")
-    return await handle("enroll", [image], subject_id)
+    uid, registration_session_id = require_finalization_identifiers(uid, registration_session_id)
+    return await handle("finalize", uid=uid, registration_session_id=registration_session_id)
+
+
+@app.post("/discard-registration-face")
+async def discard_registration_face(registration_session_id: str = Form(...),
+                                    _: bool = Depends(require_api_key)):
+    registration_session_id = require_registration_session_id(registration_session_id)
+    return await handle("discard", registration_session_id=registration_session_id)
