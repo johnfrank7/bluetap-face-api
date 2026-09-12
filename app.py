@@ -9,6 +9,7 @@ from runtime import (MODEL_NAME, DETECTOR_BACKEND, ANTI_SPOOFING,
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 from image_utils import prepare_image
 
@@ -93,7 +94,13 @@ UID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 REGISTRATION_SESSION_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 
 
-def process(operation, uploads=(), uid=None, registration_session_id=None):
+class DevelopmentResetRequest(BaseModel):
+    dryRun: bool
+    confirm: str | None = None
+
+
+def process(operation, uploads=(), uid=None, registration_session_id=None,
+            dry_run=True, confirmation=None):
     if operation in {"verify", "duplicate", "store"} and not model_ready():
         raise HTTPException(503, "Face model is not ready. Please retry later.")
     if not INFERENCE_LOCK.acquire(blocking=False):
@@ -105,7 +112,9 @@ def process(operation, uploads=(), uid=None, registration_session_id=None):
         images = [prepare_image(upload) for upload in uploads]
         from face_service import (discard_registration_face, finalize_registration_face,
                                   generate_embedding, search_duplicate,
-                                  store_registration_face)
+                                  store_registration_face, reset_development_face_storage)
+        if operation == "development-reset":
+            return reset_development_face_storage(dry_run, confirmation)
         if operation == "discard":
             return {"discarded": discard_registration_face(registration_session_id)}
         if operation == "finalize":
@@ -130,7 +139,10 @@ def process(operation, uploads=(), uid=None, registration_session_id=None):
         return {"stored": True, "duplicateDetected": False, "reviewRequired": False, **temporary}
     except HTTPException:
         raise
-    except ValueError as error:
+    except (PermissionError, ValueError) as error:
+        if operation == "development-reset":
+            logger.warning("Development face reset rejected: %s", error)
+            raise HTTPException(403, str(error)) from None
         if operation == "finalize":
             logger.info("Face finalization rejected: %s", error)
             raise HTTPException(409, str(error)) from None
@@ -142,14 +154,18 @@ def process(operation, uploads=(), uid=None, registration_session_id=None):
                                   "duplicate": "Duplicate face check failed.",
                                   "store": "Temporary registration face storage failed.",
                                   "finalize": "Face enrollment failed.",
-                                  "discard": "Temporary registration cleanup failed."}[operation]) from None
+                                  "discard": "Temporary registration cleanup failed.",
+                                  "development-reset": "Development face reset failed."}[operation]) from None
     finally:
         INFERENCE_LOCK.release()
 
 
-async def handle(operation, uploads=(), uid=None, registration_session_id=None):
+async def handle(operation, uploads=(), uid=None, registration_session_id=None,
+                 dry_run=True, confirmation=None):
     try:
-        return await run_in_threadpool(process, operation, uploads, uid, registration_session_id)
+        return await run_in_threadpool(
+            process, operation, uploads, uid, registration_session_id, dry_run, confirmation
+        )
     finally:
         # Closes and deletes Starlette's spooled temporary upload files.
         for upload in uploads:
@@ -200,3 +216,22 @@ async def discard_registration_face(registration_session_id: str = Form(...),
                                     _: bool = Depends(require_api_key)):
     registration_session_id = require_registration_session_id(registration_session_id)
     return await handle("discard", registration_session_id=registration_session_id)
+
+
+@app.post("/admin/reset-development-enrollments")
+async def reset_development_enrollments(
+    request: DevelopmentResetRequest,
+    _: bool = Depends(require_api_key),
+):
+    """Reset a dedicated development dataset; never enabled implicitly."""
+    if os.getenv("ENABLE_DEVELOPMENT_FACE_RESET", "").lower() != "true":
+        raise HTTPException(403, "Development face reset is disabled.")
+    if os.getenv("FACE_DATA_ENVIRONMENT", "").lower() != "development":
+        raise HTTPException(403, "Face storage is not declared as development-only.")
+    if not request.dryRun and request.confirm != "RESET_BLUETAP_FACE_DEV":
+        raise HTTPException(403, "Exact development reset confirmation is required.")
+    return await handle(
+        "development-reset",
+        dry_run=request.dryRun,
+        confirmation=request.confirm,
+    )

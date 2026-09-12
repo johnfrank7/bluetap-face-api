@@ -9,6 +9,7 @@ from runtime import MODEL_NAME, EMBEDDING_SCHEMA, DISTANCE_THRESHOLD, embedding,
 FACE_DATA_DIR = Path("face-data")
 FACE_DATABASE_PATH = FACE_DATA_DIR / "embeddings.json"
 REGISTRATION_FACE_TTL_SECONDS = int(os.getenv("REGISTRATION_FACE_TTL_SECONDS", "3600"))
+DEVELOPMENT_RESET_CONFIRMATION = "RESET_BLUETAP_FACE_DEV"
 
 
 # Same cosine distance threshold as pair verification.
@@ -124,6 +125,43 @@ def discard_registration_face(registration_session_id):
     deleted = len(database["temporary_registrations"]) != original_count
     save_database(database)
     return deleted
+
+
+def reset_development_face_storage(dry_run=True, confirmation=None):
+    """Inspect or clear only a server-declared, dedicated development store."""
+    if os.getenv("ENABLE_DEVELOPMENT_FACE_RESET", "").lower() != "true":
+        raise PermissionError("Development face reset is disabled.")
+    if os.getenv("FACE_DATA_ENVIRONMENT", "").lower() != "development":
+        raise PermissionError("Face storage is not declared as development-only.")
+    if not dry_run and confirmation != DEVELOPMENT_RESET_CONFIRMATION:
+        raise ValueError("Exact development reset confirmation is required.")
+
+    database = load_database()
+    subjects = database.get("subjects", [])
+    temporary = database.get("temporary_registrations", [])
+    finalized_count = sum(1 for item in subjects if item.get("finalized") is True)
+    orphaned_count = len(subjects) - finalized_count
+    temporary_count = len(temporary)
+    total_count = len(subjects) + temporary_count
+    result = {
+        "success": True,
+        "dryRun": bool(dry_run),
+        "scope": "development",
+        "finalizedEnrollments": finalized_count,
+        "orphanedEnrollments": orphaned_count,
+        "temporaryRegistrations": temporary_count,
+        "totalEntries": total_count,
+        "wouldDelete": total_count,
+        "deletedEntries": 0,
+    }
+    if dry_run:
+        return result
+
+    database["subjects"] = []
+    database["temporary_registrations"] = []
+    save_database(database)
+    result["deletedEntries"] = total_count
+    return result
 
 
 def finalize_registration_face(uid, registration_session_id):
